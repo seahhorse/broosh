@@ -2,15 +2,20 @@
 // Import external libraries
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_ADXL345_U.h>
+#include <Adafruit_MPU6050.h>
 #include <Geometry.h>
 #include <U8g2lib.h>
 #include <AsyncDelay.h>
+#include <ESP8266WiFi.h>
 #include "logo.h"
 
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified();
+Adafruit_MPU6050 mpu;
 AsyncDelay tick;
 U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+WiFiServer server(80);
+
+const char* ssid = "***";
+const char* password = "***";
 
 /**
  * Constants that should be given their own .h file in due course.
@@ -108,99 +113,149 @@ void setup(void) {
     u8g2.begin();
     tick.start(FPS, AsyncDelay::MILLIS);
 
+    // Connect to Wi-Fi network with SSID and password
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    // Print local IP address and start web server
+    Serial.println("");
+    Serial.println("WiFi connected.");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+    server.begin();
+
     // Check if accelerometer is detected
-    if(!accel.begin()) {
-        Serial.println("Accelerometer not detected.");
+    if(!mpu.begin()) {
+        Serial.println("Accelerometer / Gyrometer not detected.");
         while(true);
     }
+
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("Setup Complete!");
 }
 
 void loop() {
 
-    // Start time of each sample
-    unsigned long start = millis();
-
-    // Take accelerometer reading
-    sensors_event_t event; 
-    accel.getEvent(&event);
-    cur_hist[0] = (int) (calibrate(event.acceleration.x, X_AT_REST, X_POSITIVE_G, X_NEGATIVE_G) * 100);
-    cur_hist[1] = (int) (calibrate(event.acceleration.y, Y_AT_REST, Y_POSITIVE_G, Y_NEGATIVE_G) * 100);
-    cur_hist[2] = (int) (calibrate(event.acceleration.z, Z_AT_REST, Z_POSITIVE_G, Z_NEGATIVE_G) * 100);
+    WiFiClient client = server.available();
     
-    // Push accelerometer reading to array
-    push(hist, &hist_fill, cur_hist);
+    if (client) {
+        while (client.connected()){
+                                  // Start time of each sample
+                                  unsigned long start = millis();
+                              
+                                  // Take accelerometer reading
+                                  sensors_event_t accel, gyro, temp; 
+                                  mpu.getEvent(&accel, &gyro, &temp);
+                                  cur_hist[0] = (int) (calibrate(accel.acceleration.x, X_AT_REST, X_POSITIVE_G, X_NEGATIVE_G) * 100);
+                                  cur_hist[1] = (int) (calibrate(accel.acceleration.y, Y_AT_REST, Y_POSITIVE_G, Y_NEGATIVE_G) * 100);
+                                  cur_hist[2] = (int) (calibrate(accel.acceleration.z, Z_AT_REST, Z_POSITIVE_G, Z_NEGATIVE_G) * 100);
+                                  
+                                  // Push accelerometer reading to array
+                                  push(hist, &hist_fill, cur_hist);
+                              
+                                  // Only attempt to calculate frequency if array of accelerometer readings is filled
+                                  if (hist_fill == SAMPLE_LENGTH) {
+                              
+                                      for (int j = 0; j < 3; j++) {
+                                          
+                                          // Use Fast Fourier Transform to calculate frequency
+                                          FFT(hist[j], SAMPLE_LENGTH, 1000.0 / period);
+                              
+                                          // Frequency range must be above a certain threshold to be classified as non-stationary
+                                          if (minmax(hist[j]) < 200) {
+                                            cur_freq[j] = 0;
+                                          } else {
+                                            cur_freq[j] = (int) (f_peaks[0] * 100);
+                                          }
+                                          
+                                      }
+                              
+                                      // Push frequency calculated to array
+                                      push(freq, &freq_fill, cur_freq);
+                              
+                                      // Calculate moving average of accelerometer readings to get orientation
+                                      for (int j = 0; j < 3; j++) {
+                                          orientation[j] = average(hist[j]);
+                                      }
+                              
+                                      // Determine which stroke brush on this sample
+                                      current_stroke = check_stroke(orientation, cur_freq);
+                                      if (last_stroke != current_stroke) {
+                                          // End of the current stroke. Add total time to stroke times 
+                                          if (last_stroke != 0) {
+                                              end_stroke_time = millis();
+                                              stroke_time[last_stroke] += end_stroke_time - start_stroke_time;
+                                          }
+                                          // Beginning of a new stroke
+                                          if (current_stroke != 0) {
+                                              start_stroke_time = millis();
+                                          }
+                                          // Update strokes
+                                          last_stroke = current_stroke;
+                                      }
+                              
+                                      // Print diagnostics
+                              //        Serial.print("Accel X: "); Serial.print((double) hist[0][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
+                              //        Serial.print("Accel Y: "); Serial.print((double) hist[1][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
+                              //        Serial.print("Accel Z: "); Serial.print((double) hist[2][SAMPLE_LENGTH - 1] / 100); Serial.println("  ");
+                              //        Serial.print("Orient X: "); Serial.print(orientation[0]); Serial.print("  ");
+                              //        Serial.print("Orient Y: "); Serial.print(orientation[1]); Serial.print("  ");
+                              //        Serial.print("Orient Z: "); Serial.print(orientation[2]); Serial.println("  ");
+                              //        Serial.print("Freq X: "); Serial.print((double) freq[0][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
+                              //        Serial.print("Freq Y: "); Serial.print((double) freq[1][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
+                              //        Serial.print("Freq Z: "); Serial.print((double) freq[2][SAMPLE_LENGTH - 1] / 100); Serial.println("  ");
+                              
+                                      for (int j = 1; j < 7; j++) {
+                                          Serial.print("(" + String(j) + "): " + stroke_time[j] + " ");
+                                      } Serial.println();
+                                      
+                                      period = millis() - start;
+                                      // Serial.print("Period: "); Serial.print(period); Serial.println(" ");
+                                  }
+                                  
+                                  // Update OLED after every tick
+                                  if (tick.isExpired()) {
+                                      drawAnimation();
+                                      display_text(stroke_time);
+                                      pos_x = pos_x + X_SHIFT;
+                                      if (pos_x > OLED_WIDTH + logo_width) {
+                                          pos_x = -logo_width;
+                                      }
+                                      tick.repeat();
+                                  }
 
-    // Only attempt to calculate frequency if array of accelerometer readings is filled
-    if (hist_fill == SAMPLE_LENGTH) {
+                                  client.print(period);
+                                  client.print(", ");
 
-        for (int j = 0; j < 3; j++) {
-
-            // Use Fast Fourier Transform to calculate frequency
-            FFT(hist[j], SAMPLE_LENGTH, (int) (1000 / period));
-
-            // Frequency range must be above a certain threshold to be classified as non-stationary
-            if (minmax(hist[j]) < 200) {
-                cur_freq[j] = 0;
-            } else {
-                cur_freq[j] = (int) (f_peaks[0] * 100);
-            }
-            
+                                  for (int j = 0; j < 3; j++) {
+                                      client.print((double) hist[j][SAMPLE_LENGTH - 1] / 100);
+                                      client.print(", ");
+                                  }
+                                  for (int j = 0; j < 3; j++) {
+                                      client.print(orientation[j]);
+                                      client.print(", ");
+                                  }
+                                  for (int j = 0; j < 3; j++) {
+                                      client.print((double) freq[j][SAMPLE_LENGTH - 1] / 100);
+                                      client.print(", ");
+                                  }
+                                  client.print(gyro.gyro.x);
+                                  client.print(", ");
+                                  client.print(gyro.gyro.y);
+                                  client.print(", ");
+                                  client.print(gyro.gyro.z);
+                                  client.print(", ");
+                                  client.print(temp.temperature);
+                                  client.println(" ");
+                                  
         }
-
-        // Push frequency calculated to array
-        push(freq, &freq_fill, cur_freq);
-
-        // Calculate moving average of accelerometer readings to get orientation
-        for (int j = 0; j < 3; j++) {
-            orientation[j] = average(hist[j]);
-        }
-
-        // Determine which stroke brush on this sample
-        current_stroke = check_stroke(orientation, cur_freq);
-        if (last_stroke != current_stroke) {
-            // End of the current stroke. Add total time to stroke times 
-            if (last_stroke != 0) {
-                end_stroke_time = millis();
-                stroke_time[last_stroke] += end_stroke_time - start_stroke_time;
-            }
-            // Beginning of a new stroke
-            if (current_stroke != 0) {
-                start_stroke_time = millis();
-            }
-            // Update strokes
-            last_stroke = current_stroke;
-        }
-
-        // Print diagnostics
-//        Serial.print("Accel X: "); Serial.print((double) hist[0][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
-//        Serial.print("Accel Y: "); Serial.print((double) hist[1][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
-//        Serial.print("Accel Z: "); Serial.print((double) hist[2][SAMPLE_LENGTH - 1] / 100); Serial.println("  ");
-//        Serial.print("Orient X: "); Serial.print(orientation[0]); Serial.print("  ");
-//        Serial.print("Orient Y: "); Serial.print(orientation[1]); Serial.print("  ");
-//        Serial.print("Orient Z: "); Serial.print(orientation[2]); Serial.println("  ");
-//        Serial.print("Freq X: "); Serial.print((double) freq[0][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
-//        Serial.print("Freq Y: "); Serial.print((double) freq[1][SAMPLE_LENGTH - 1] / 100); Serial.print("  ");
-//        Serial.print("Freq Z: "); Serial.print((double) freq[2][SAMPLE_LENGTH - 1] / 100); Serial.println("  ");
-
-        for (int j = 1; j < 7; j++) {
-            Serial.print("(" + j + "): " + strokes[j] + " ");
-        } Serial.println();
-        
-        period = millis() - start;
-        // Serial.print("Period: "); Serial.print(period); Serial.println(" ");
     }
-    
-    // Update OLED after every tick
-    if (tick.isExpired()) {
-        drawAnimation();
-        display_text(strokes);
-        pos_x = pos_x + X_SHIFT;
-        if (pos_x > OLED_WIDTH + logo_width) {
-            pos_x = -logo_width;
-        }
-        tick.repeat();
-    }
-
 }
 
 /**
@@ -266,7 +321,7 @@ double minmax(int hist[SAMPLE_LENGTH]) {
 /**
  * Fast Fourier Transform to quickly find frequency of brushing.
  */
-float FFT(int in[],int N,float Frequency) {
+void FFT(int in[],int N,float Frequency) {
 
     unsigned int data[13]={1,2,4,8,16,32,64,128,256,512,1024,2048};
     int a,c1,f,o,x;
@@ -342,6 +397,7 @@ float FFT(int in[],int N,float Frequency) {
         }
         c=c+1;
     }
+
     for(int i=0;i<5;i++) {     // updating f_peak array (global variable)with descending order
         f_peaks[i]=out_im[in_ps[i]];
     }
@@ -437,4 +493,25 @@ float cosine(int i) {
   else if(j>180 && j<271){out= -sine_data[270-j];}
   else if(j>270 && j<361){out= sine_data[j-270];}
   return (out/255);
+}
+
+String prepareHtmlPage(double orientation[3]) {
+  String htmlPage;
+  htmlPage.reserve(1024);               // prevent ram fragmentation
+  // Header and Doctype
+  htmlPage = F("HTTP/1.1 200 OK\r\n"
+               "Content-Type: text/html\r\n"
+               "Connection: close\r\n"  // the connection will be closed after completion of the response
+               "Refresh: 5\r\n"         // refresh the page automatically every 5 sec
+               "\r\n"
+               "<!DOCTYPE HTML>"
+               "<html>");
+  // Body
+  for (int i = 0; i < 3; i++) {
+      htmlPage += String(orientation[i]);
+  }
+  // Footer
+  htmlPage += F("</html>"
+                "\r\n");
+  return htmlPage;
 }
